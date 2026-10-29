@@ -1,0 +1,653 @@
+name: Compile Radar Firmware
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: "Select the build type"
+        required: true
+        type: choice
+        options:
+          - "build-only"
+          - "prerelease"
+          - "all"
+        default: "build-only"
+      releaseVersion:
+        description: "Release tag (e.g. v1.0.0). Leave empty to auto-generate"
+        required: false
+        type: string
+        default: ""
+      releaseName:
+        description: "Release name (e.g. 'Bug Fix Release'). Leave empty for auto-generated"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build:
+    name: Build for ${{ matrix.target.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        target:
+          - { name: "esp32s3-radar-node", idf_target: "esp32s3", sdkconfig_file: "sdkconfig.defaults", app_name: "rd03d_radar_node", zip_name: "RD03D-Radar-Node-ESP32S3.zip" }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - uses: actions/cache@v4
+        id: cache-idf
+        with:
+          path: |
+            ~/esp-idf
+            ~/.espressif
+          key: esp-idf-v6.1-${{ runner.os }}-v1
+
+      - name: Install ESP-IDF Dependencies
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget git flex bison gperf python3-pip python3-setuptools cmake ninja-build ccache libffi-dev libssl-dev dfu-util
+
+      - name: Install ESP-IDF
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone -b v6.1 --depth 1 --recursive https://github.com/espressif/esp-idf.git ~/esp-idf
+          ~/esp-idf/install.sh
+
+      - name: Repair cached ESP-IDF Python environment if broken
+        if: steps.cache-idf.outputs.cache-hit == 'true'
+        run: |
+          # The cached venv's bin/python symlinks into the runner's Python
+          # toolcache (/opt/hostedtoolcache/Python/3.10.x/...). GitHub bumps
+          # the patch version on image updates, evicting the old path and
+          # breaking the symlink -- export.sh then fails with "virtual
+          # environment not found". Detect that and rebuild just the venv;
+          # the toolchains under ~/.espressif/tools stay cached, so this is
+          # fast (only pip installs the requirements).
+          # Derive the venv name the same way ESP-IDF does (idf_tools.py):
+          # idf{MAJOR.MINOR}_py{PY_MAJOR.MINOR}_env. Note: there is no
+          # version.txt at the repo root -- the version comes from the
+          # esp_idf_version.h header.
+          IDF_VER=$(sed -nE 's/^#define ESP_IDF_VERSION_(MAJOR|MINOR) +([0-9]+)/\2/p' \
+            ~/esp-idf/components/esp_common/include/esp_idf_version.h | paste -sd.)
+          PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+          VENV="$HOME/.espressif/python_env/idf${IDF_VER}_py${PY_VER}_env"
+          if [ -x "$VENV/bin/python" ]; then
+            echo "ESP-IDF Python env is usable: $VENV"
+          else
+            echo "Cached ESP-IDF Python env ($VENV) is missing or broken; recreating..."
+            rm -rf "$VENV"
+            ~/esp-idf/install.sh
+          fi
+
+      - name: Apply Custom SDK Config
+        run: |
+          # Single-config project: sdkconfig.defaults at the repo root is the
+          # source of truth. Only copy when a matrix entry points elsewhere
+          # (keeps parity with the GhostESP compile_all layout for future boards).
+          if [ "${{ matrix.target.sdkconfig_file }}" != "sdkconfig.defaults" ]; then
+            rm -f sdkconfig sdkconfig.defaults
+            cp "${{ matrix.target.sdkconfig_file }}" sdkconfig.defaults
+          else
+            rm -f sdkconfig
+          fi
+          echo "Using sdkconfig.defaults:"
+          cat sdkconfig.defaults
+
+      - name: Set up ESP-IDF Environment
+        run: |
+          . ~/esp-idf/export.sh
+          export IDF_TARGET=${{ matrix.target.idf_target }}
+          echo "IDF_TARGET=${{ matrix.target.idf_target }}" >> $GITHUB_ENV
+          idf.py set-target ${{ matrix.target.idf_target }}
+
+      - name: Clean and Build Project
+        env:
+          SDKCONFIG_DEFAULTS: "sdkconfig.defaults"
+        run: |
+          . ~/esp-idf/export.sh
+          export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+          idf.py build || {
+            echo "Build failed for ${{ matrix.target.name }}"
+            exit 1
+          }
+
+      - name: Verify Bootloader Exists
+        run: |
+          BOOTLOADER_PATH="build/bootloader/bootloader.bin"
+          if [ ! -f "$BOOTLOADER_PATH" ]; then
+            echo "Error: Bootloader not found at $BOOTLOADER_PATH"
+            exit 1
+          fi
+          echo "Bootloader found at $BOOTLOADER_PATH"
+
+      - name: Package Artifacts into ZIP
+        run: |
+          . ~/esp-idf/export.sh
+          ARTIFACT_DIR="packaged_artifacts_${{ matrix.target.name }}"
+          ZIP_FILE="${{ matrix.target.zip_name }}"
+          APP_NAME="${{ matrix.target.app_name }}"
+          ELF_FILE="${ZIP_FILE%.zip}.elf"
+          mkdir -p "$ARTIFACT_DIR"
+          cp build/partition_table/partition-table.bin "$ARTIFACT_DIR/partitions.bin" || { echo "Failed to copy partition table"; exit 1; }
+          cp build/bootloader/bootloader.bin "$ARTIFACT_DIR/bootloader.bin" || { echo "Failed to copy bootloader"; exit 1; }
+          cp "build/${APP_NAME}.bin" "$ARTIFACT_DIR/firmware.bin" || { echo "Failed to copy app binary build/${APP_NAME}.bin"; exit 1; }
+          IDF_TARGET="${{ matrix.target.idf_target }}"
+          if [ -f "build/${APP_NAME}.elf" ]; then
+            cp "build/${APP_NAME}.elf" "$ARTIFACT_DIR/$ELF_FILE" || { echo "Failed to copy app elf"; exit 1; }
+          fi
+          # Source flash mode/freq/size from the resolved build config so
+          # merge_bin's header re-stamp exactly matches what the binaries were
+          # compiled with. merge_bin does NOT recompute each image's SHA-256, so
+          # any mismatch here breaks the bootloader's per-boot image check (and a
+          # too-small size also makes partitions past that size unreachable).
+          get_cfg() { sed -nE "s/^#define $1 \"([^\"]*)\"/\1/p" build/config/sdkconfig.h; }
+          FLASH_MODE=$(get_cfg CONFIG_ESPTOOLPY_FLASHMODE)
+          FLASH_FREQ=$(get_cfg CONFIG_ESPTOOLPY_FLASHFREQ)
+          FLASH_SIZE=$(get_cfg CONFIG_ESPTOOLPY_FLASHSIZE)
+          FLASH_MODE=${FLASH_MODE:-dio}
+          FLASH_FREQ=${FLASH_FREQ:-40m}
+          FLASH_SIZE=${FLASH_SIZE:-4MB}
+          if [ "$IDF_TARGET" = "esp32" ] || [ "$IDF_TARGET" = "esp32s2" ]; then
+            BOOT_OFFSET=0x1000
+          elif [ "$IDF_TARGET" = "esp32p4" ]; then
+            BOOT_OFFSET=0x2000
+          else
+            BOOT_OFFSET=0x0
+          fi
+          # The app offset is NOT always 0x10000: the OTA tables put otadata
+          # there and the first app slot at 0x20000 or above, so a hardcoded
+          # offset writes the app over otadata and leaves every app slot empty
+          # ("No bootable app partitions"). Read the real offset out of the
+          # partition table this build produced -- factory if present, else the
+          # lowest OTA slot, which is what the bootloader falls back to when
+          # otadata is blank (as it is on a fresh flash).
+          APP_OFFSET=$(python3 - "$ARTIFACT_DIR/partitions.bin" <<'PY'
+          import pathlib, struct, sys
+          FMT = "<2sBBLL16sL"
+          SZ = struct.calcsize(FMT)
+          table = pathlib.Path(sys.argv[1]).read_bytes()
+          factory, ota = None, {}
+          for pos in range(0, len(table) - SZ + 1, SZ):
+              magic, ptype, subtype, offset, _size, _label, _flags = struct.unpack(
+                  FMT, table[pos:pos + SZ])
+              if magic != bytes((0xAA, 0x50)):
+                  break  # end of table (MD5 entry or padding)
+              if ptype != 0x00:  # not an app partition
+                  continue
+              if subtype == 0x00 and factory is None:
+                  factory = offset
+              elif 0x10 <= subtype <= 0x1F:
+                  ota.setdefault(subtype, offset)
+          if factory is None and not ota:
+              sys.exit("no factory or ota app partition in table")
+          print("0x%x" % (factory if factory is not None else ota[min(ota)]))
+          PY
+          ) || { echo "Failed to read app offset from partition table"; exit 1; }
+          echo "App offset for ${{ matrix.target.name }}: $APP_OFFSET"
+
+          python3 -m esptool --chip "$IDF_TARGET" merge_bin \
+            --output "$ARTIFACT_DIR/merged.bin" \
+            --flash_mode "$FLASH_MODE" \
+            --flash_freq "$FLASH_FREQ" \
+            --flash_size "$FLASH_SIZE" \
+            --target-offset 0x0 \
+            "$BOOT_OFFSET" "$ARTIFACT_DIR/bootloader.bin" \
+            0x8000 "$ARTIFACT_DIR/partitions.bin" \
+            "$APP_OFFSET" "$ARTIFACT_DIR/firmware.bin" \
+            || { echo "Failed to create merged binary"; exit 1; }
+
+          zip -j "$ZIP_FILE" "$ARTIFACT_DIR"/* || { echo "Failed to create ZIP $ZIP_FILE"; exit 1; }
+          ls -lh "$ZIP_FILE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: artifact-${{ matrix.target.zip_name }}
+          path: ${{ matrix.target.zip_name }}
+
+  update_manifest_for_commit:
+    name: Update Commit Manifest (push)
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.buildType != 'build-only'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_build_artifacts
+
+      - name: Fetch current run artifact index
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/artifacts?per_page=100" > artifact_index.json
+
+      - name: Update root manifest with commit configs
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          sha = os.environ["GITHUB_SHA"]
+          run_id = os.environ["GITHUB_RUN_ID"]
+          now = datetime.now(timezone.utc).isoformat()
+
+          path = "firmware-manifest.json"
+          if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fp:
+              manifest = json.load(fp)
+          else:
+            manifest = {
+              "schema_version": 2,
+              "repository": repo,
+              "generated_by": "compile_all.yml",
+              "commits": {},
+            }
+
+          manifest["schema_version"] = 2
+          manifest["repository"] = repo
+          manifest["updated_at"] = now
+
+          zips = sorted({os.path.basename(p) for p in glob.glob("all_build_artifacts/**/*.zip", recursive=True)})
+          with open("artifact_index.json", "r", encoding="utf-8") as fp:
+            artifact_index = json.load(fp)
+          artifacts = artifact_index.get("artifacts", [])
+          artifact_ids = {a.get("name"): a.get("id") for a in artifacts if a.get("name") and a.get("id")}
+
+          items = []
+          for zip_name in zips:
+            artifact_name = f"artifact-{zip_name}"
+            artifact_id = artifact_ids.get(artifact_name)
+            download_url = None
+            if artifact_id is not None:
+              download_url = f"https://github.com/{repo}/actions/runs/{run_id}/artifacts/{artifact_id}"
+            items.append({
+              "config": Path(zip_name).stem,
+              "zip_name": zip_name,
+              "channel": "commit",
+              "release_tag": None,
+              "download_url": download_url,
+              "artifact_run_url": f"https://github.com/{repo}/actions/runs/{run_id}",
+            })
+
+          commits = manifest.setdefault("commits", {})
+          entry = commits.get(sha, {})
+          refs = entry.get("release_refs", [])
+          entry.update({
+            "source_commit": sha,
+            "last_channel": "commit",
+            "last_tag": None,
+            "updated_at": now,
+            "configs": items,
+            "release_refs": refs,
+          })
+          commits[sha] = entry
+
+          with open(path, "w", encoding="utf-8") as fp:
+            json.dump(manifest, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+          PY
+
+      # - name: Commit root manifest
+      #   env:
+      #     BRANCH: ${{ github.event.repository.default_branch }}
+      #   run: |
+      #     git add firmware-manifest.json
+      #     if git diff --cached --quiet; then
+      #       echo "Manifest unchanged; no commit needed."
+      #     else
+      #       git fetch origin "${BRANCH}"
+      #       git reset --soft FETCH_HEAD
+      #       git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Update firmware manifest for ${GITHUB_SHA::7} [skip ci]"
+      #       git push origin "HEAD:${BRANCH}"
+      #     fi
+
+  upload_prerelease:
+    name: Create Pre-release and Upload Artifacts
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.buildType == 'prerelease'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_build_artifacts
+
+      - name: Verify and Prepare Artifacts for Upload
+        run: |
+          mkdir -p release_assets
+          find all_build_artifacts -name '*.zip' -exec cp {} release_assets/ \;
+          echo "Prepared release assets:"
+          ls -lh release_assets
+
+      - name: Generate Pre-release Tag and Title
+        id: pre_release_info
+        run: |
+          if [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TAG_NAME="${{ github.event.inputs.releaseVersion }}"
+          else
+            TAG_NAME="prerelease-$(date +'%Y%m%d-%H%M%S')-${GITHUB_SHA::7}"
+          fi
+
+          if [ -n "${{ github.event.inputs.releaseName }}" ]; then
+            TITLE="${{ github.event.inputs.releaseName }}"
+          elif [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TITLE="Release $TAG_NAME"
+          else
+            TITLE="Pre-release $(date +'%Y-%m-%d %H:%M:%S')"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_title=$TITLE" >> $GITHUB_OUTPUT
+          echo "Generated Tag: $TAG_NAME"
+          echo "Generated Title: $TITLE"
+
+      - name: Update Root Firmware Manifest
+        env:
+          TAG: ${{ steps.pre_release_info.outputs.tag_name }}
+          CHANNEL: prerelease
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          channel = os.environ["CHANNEL"]
+          sha = os.environ["GITHUB_SHA"]
+          now = datetime.now(timezone.utc).isoformat()
+
+          path = "firmware-manifest.json"
+          if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fp:
+              manifest = json.load(fp)
+          else:
+            manifest = {
+              "schema_version": 2,
+              "repository": repo,
+              "generated_by": "compile_all.yml",
+              "commits": {},
+            }
+
+          manifest["schema_version"] = 2
+          manifest["repository"] = repo
+          manifest["updated_at"] = now
+
+          items = []
+          for zip_path in sorted(glob.glob("release_assets/*.zip")):
+            zip_name = os.path.basename(zip_path)
+            stem = Path(zip_name).stem
+            items.append({
+              "config": stem,
+              "zip_name": zip_name,
+              "channel": channel,
+              "release_tag": tag,
+              "download_url": f"https://github.com/{repo}/releases/download/{tag}/{zip_name}",
+            })
+
+          commits = manifest.setdefault("commits", {})
+          entry = commits.get(sha, {})
+          refs = entry.get("release_refs", [])
+          if not any(r.get("tag") == tag for r in refs):
+            refs.append({"tag": tag, "channel": channel, "updated_at": now})
+
+          entry.update({
+            "source_commit": sha,
+            "last_channel": channel,
+            "last_tag": tag,
+            "updated_at": now,
+            "configs": items,
+            "release_refs": refs,
+          })
+          commits[sha] = entry
+
+          with open(path, "w", encoding="utf-8") as fp:
+            json.dump(manifest, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+          PY
+
+      # - name: Commit Root Manifest to Repository
+      #   env:
+      #     TAG: ${{ steps.pre_release_info.outputs.tag_name }}
+      #     BRANCH: ${{ github.event.repository.default_branch }}
+      #   run: |
+      #     git add firmware-manifest.json
+      #     if git diff --cached --quiet; then
+      #       echo "Manifest unchanged; no commit needed."
+      #     else
+      #       git fetch origin "${BRANCH}"
+      #       git reset --soft FETCH_HEAD
+      #       git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Update firmware manifest for ${TAG} [skip ci]"
+      #       git push origin "HEAD:${BRANCH}"
+      #     fi
+
+      - name: Create GitHub Pre-Release and Upload Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.pre_release_info.outputs.tag_name }}
+          TITLE: ${{ steps.pre_release_info.outputs.release_title }}
+        run: |
+          echo "Creating pre-release with tag $TAG and title '$TITLE'"
+          cat > release_notes.md <<EOF
+          Automated pre-release build for tag $TAG.
+
+          Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG
+          Changelog: https://github.com/$GITHUB_REPOSITORY/blob/$TAG/CHANGELOG.md
+
+          Flash merged.bin with esptool or your preferred ESP32-S3 flasher.
+          EOF
+          if [ -z "$(ls -A release_assets/*.zip 2>/dev/null)" ]; then
+            echo "No ZIP files found in release_assets. Creating pre-release without assets."
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release_notes.md \
+              --prerelease
+          else
+            echo "Uploading assets from release_assets:"
+            ls -l release_assets/*.zip
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release_notes.md \
+              --prerelease \
+              release_assets/*.zip
+          fi
+          echo "Pre-release creation attempted."
+
+  upload_release:
+    name: Create Release and Upload Artifacts
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.buildType == 'all'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all_build_artifacts
+
+      - name: Verify and Prepare Artifacts for Upload
+        run: |
+          mkdir -p release_assets
+          find all_build_artifacts -name '*.zip' -exec cp {} release_assets/ \;
+          echo "Prepared release assets:"
+          ls -lh release_assets
+
+      - name: Generate Release Tag and Title
+        id: release_info
+        run: |
+          if [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TAG_NAME="${{ github.event.inputs.releaseVersion }}"
+          else
+            TAG_NAME="v$(date +'%Y.%m.%d')-${GITHUB_SHA::7}"
+          fi
+
+          if [ -n "${{ github.event.inputs.releaseName }}" ]; then
+            TITLE="${{ github.event.inputs.releaseName }}"
+          elif [ -n "${{ github.event.inputs.releaseVersion }}" ]; then
+            TITLE="Release $TAG_NAME"
+          else
+            TITLE="Release $(date +'%Y-%m-%d %H:%M:%S')"
+          fi
+
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "release_title=$TITLE" >> $GITHUB_OUTPUT
+          echo "Generated Tag: $TAG_NAME"
+          echo "Generated Title: $TITLE"
+
+      - name: Update Root Firmware Manifest
+        env:
+          TAG: ${{ steps.release_info.outputs.tag_name }}
+          CHANNEL: stable
+        run: |
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          repo = os.environ["GITHUB_REPOSITORY"]
+          tag = os.environ["TAG"]
+          channel = os.environ["CHANNEL"]
+          sha = os.environ["GITHUB_SHA"]
+          now = datetime.now(timezone.utc).isoformat()
+
+          path = "firmware-manifest.json"
+          if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as fp:
+              manifest = json.load(fp)
+          else:
+            manifest = {
+              "schema_version": 2,
+              "repository": repo,
+              "generated_by": "compile_all.yml",
+              "commits": {},
+            }
+
+          manifest["schema_version"] = 2
+          manifest["repository"] = repo
+          manifest["updated_at"] = now
+
+          items = []
+          for zip_path in sorted(glob.glob("release_assets/*.zip")):
+            zip_name = os.path.basename(zip_path)
+            stem = Path(zip_name).stem
+            items.append({
+              "config": stem,
+              "zip_name": zip_name,
+              "channel": channel,
+              "release_tag": tag,
+              "download_url": f"https://github.com/{repo}/releases/download/{tag}/{zip_name}",
+            })
+
+          commits = manifest.setdefault("commits", {})
+          entry = commits.get(sha, {})
+          refs = entry.get("release_refs", [])
+          if not any(r.get("tag") == tag for r in refs):
+            refs.append({"tag": tag, "channel": channel, "updated_at": now})
+
+          entry.update({
+            "source_commit": sha,
+            "last_channel": channel,
+            "last_tag": tag,
+            "updated_at": now,
+            "configs": items,
+            "release_refs": refs,
+          })
+          commits[sha] = entry
+
+          with open(path, "w", encoding="utf-8") as fp:
+            json.dump(manifest, fp, indent=2, sort_keys=True)
+            fp.write("\n")
+          PY
+
+      # - name: Commit Root Manifest to Repository
+      #   env:
+      #     TAG: ${{ steps.release_info.outputs.tag_name }}
+      #     BRANCH: ${{ github.event.repository.default_branch }}
+      #   run: |
+      #     git add firmware-manifest.json
+      #     if git diff --cached --quiet; then
+      #       echo "Manifest unchanged; no commit needed."
+      #     else
+      #       git fetch origin "${BRANCH}"
+      #       git reset --soft FETCH_HEAD
+      #       git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" commit -m "Update firmware manifest for ${TAG} [skip ci]"
+      #       git push origin "HEAD:${BRANCH}"
+      #     fi
+
+      - name: Create GitHub Release and Upload Assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.release_info.outputs.tag_name }}
+          TITLE: ${{ steps.release_info.outputs.release_title }}
+        run: |
+          echo "Creating release with tag $TAG and title '$TITLE'"
+          cat > release_notes.md <<EOF
+          Automated release build for tag $TAG.
+
+          Release: https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG
+          Changelog: https://github.com/$GITHUB_REPOSITORY/blob/$TAG/CHANGELOG.md
+
+          Flash merged.bin with esptool or your preferred ESP32-S3 flasher.
+          EOF
+          if [ -z "$(ls -A release_assets/*.zip 2>/dev/null)" ]; then
+            echo "No ZIP files found in release_assets. Creating release without assets."
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release_notes.md \
+              --latest
+          else
+            echo "Uploading assets from release_assets:"
+            ls -l release_assets/*.zip
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file release_notes.md \
+              --latest \
+              release_assets/*.zip
+          fi
+          echo "Release creation attempted."
