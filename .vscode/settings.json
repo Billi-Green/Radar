@@ -1,5 +1,5 @@
 {
-  "idf.currentSetup": "C:\\esp-idf 6.1\\.espressif\\v6.1\\esp-idf",
+  "idf.currentSetup": "C:\\.espressif\\v6.1\\esp-idf",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },

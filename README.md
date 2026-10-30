@@ -1,40 +1,54 @@
 # RD-03D Radar Node
 
-Standalone ESP-IDF firmware for an ESP32-S3 connected to an AI-Thinker RD-03D.
+Standalone ESP-IDF firmware for a Seeed Studio XIAO ESP32-S3 or ESP32-C3
+connected to an AI-Thinker RD-03D.
 The node exposes the radar over ESP-NOW for the GhostESP RD-03D Radar app.
 
 ## Hardware
 
 Required parts:
 
-- ESP32-S3 development board
+- Seeed Studio XIAO ESP32-S3 or XIAO ESP32-C3
 - AI-Thinker RD-03D radar module
 - 3.3V-to-5V boost/buck-boost converter for a stable 5V radar supply
-- Common ground between the ESP32-S3 and radar module
+- Single-cell Li-ion/LiPo battery and a 1MΩ/1MΩ battery voltage divider
+- Common ground between the XIAO, battery divider, and radar module
 
 Default wiring:
 
-| RD-03D | ESP32-S3 |
-| --- | --- |
-| VCC | Stable 5V |
-| GND | GND |
-| TX | GPIO2 / UART2 RX |
-| RX | GPIO1 / UART2 TX |
+| Connection | XIAO pin | ESP32-S3 | ESP32-C3 |
+| --- | --- | --- | --- |
+| Radar VCC | Stable 5V supply | | |
+| Radar GND | GND | | |
+| Radar TX | D1 (XIAO RX) | GPIO2 / UART2 RX | GPIO3 / UART1 RX |
+| Radar RX | D0 (XIAO TX) | GPIO1 / UART2 TX | GPIO2 / UART1 TX |
+| Battery divider midpoint | D2 (ADC) | GPIO3 / ADC1 | GPIO4 / ADC1 |
 
 UART wiring is crossed: radar TX goes to the ESP32 RX pin, and radar RX goes
 to the ESP32 TX pin. Do not power the radar from an overloaded 3.3V rail.
+On the C3, D0/GPIO2 is a strapping pin; ensure the connected radar does not
+hold it in the wrong state during boot.
+
+Connect the battery positive terminal to a 1MΩ resistor, its other end to D2,
+and another 1MΩ resistor from D2 to ground. Place a 100nF capacitor between D2
+and ground. The firmware doubles the calibrated ADC voltage to estimate cell
+voltage. The displayed percentage uses a simple 3.0V–4.2V linear estimate;
+it is not a dedicated fuel gauge and varies with battery and load. Readings
+outside 2.5V–4.5V or without ADC calibration are reported as unavailable.
 
 ## Build And Flash
 
 Use ESP-IDF 6.1 from an activated ESP-IDF PowerShell session:
 
+Choose the target for your board, then build and flash it:
+
 ```powershell
-idf.py set-target esp32s3
+idf.py set-target esp32s3   # XIAO ESP32-S3; use esp32c3 for XIAO ESP32-C3
 idf.py build
 idf.py -p COM14 flash monitor
 ```
 
-Replace `COM14` with the serial port for the ESP32-S3. The radar driver is
+Replace `COM14` with the serial port for your XIAO. The radar driver is
 part of the `main` component.
 
 ## Make Your Own Node
@@ -43,9 +57,7 @@ The easiest way to build a compatible module is to copy this project and edit
 the constants near the top of `main/main.c`:
 
 ```c
-#define RADAR_UART_PORT UART_NUM_2
-#define RADAR_UART_RX_PIN GPIO_NUM_2
-#define RADAR_UART_TX_PIN GPIO_NUM_1
+// UART port and GPIOs are selected by ESP-IDF target in main/main.c.
 #define RADAR_UART_BAUD 256000
 #define RADAR_CHANNEL 1
 ```
@@ -58,7 +70,7 @@ command, and telemetry formats below.
 The firmware initializes the sensor like this:
 
 ```c
-radar_sensor_init(&s_radar, UART_NUM_2, GPIO_NUM_2, GPIO_NUM_1);
+radar_sensor_init(&s_radar, RADAR_UART_PORT, RADAR_UART_RX_PIN, RADAR_UART_TX_PIN);
 radar_sensor_begin(&s_radar, 256000);
 radar_sensor_enable_retention(&s_radar, false);
 ```
@@ -124,6 +136,10 @@ Field requirements:
 
 The GhostESP app displays distance and position in metres, but the wire format
 remains millimetres for compatibility.
+
+While streaming, the node also sends `RADAR_BATTERY,millivolts,percent` about
+every five seconds. Both fields are `-1` when the measurement is unavailable.
+Older radar apps ignore this separate message.
 
 ## Diagnostics
 

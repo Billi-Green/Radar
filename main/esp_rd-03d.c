@@ -147,8 +147,8 @@ esp_err_t radar_sensor_init(radar_sensor_t* sensor,
   ESP_LOGI(TAG,
            "Radar sensor initialized with retention: detection=%lu ms, "
            "absence=%lu ms",
-            sensor->retention[0].detection_retention_ms,
-            sensor->retention[0].absence_retention_ms);
+            (unsigned long)sensor->retention[0].detection_retention_ms,
+            (unsigned long)sensor->retention[0].absence_retention_ms);
 
   return ESP_OK;
 }
@@ -463,7 +463,7 @@ void radar_sensor_set_retention_times(radar_sensor_t* sensor,
   }
 
   ESP_LOGI(TAG, "Retention times updated: detection=%lu ms, absence=%lu ms",
-           detection_retention_ms, absence_retention_ms);
+           (unsigned long)detection_retention_ms, (unsigned long)absence_retention_ms);
 }
 
 void radar_sensor_enable_retention(radar_sensor_t* sensor, bool enable) {
