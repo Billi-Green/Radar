@@ -1,5 +1,8 @@
 #include "esp_rd-03d.h"
 
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -16,10 +19,23 @@
 #include <stdio.h>
 #include <string.h>
 
+#if CONFIG_IDF_TARGET_ESP32S3
+// XIAO D1 / D0 / D2 respectively.
 #define RADAR_UART_PORT UART_NUM_2
 #define RADAR_UART_RX_PIN GPIO_NUM_2
 #define RADAR_UART_TX_PIN GPIO_NUM_1
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_2  // D2, GPIO3, ADC1
+#elif CONFIG_IDF_TARGET_ESP32C3
+#define RADAR_UART_PORT UART_NUM_1
+#define RADAR_UART_RX_PIN GPIO_NUM_3
+#define RADAR_UART_TX_PIN GPIO_NUM_2
+#define BATTERY_ADC_CHANNEL ADC_CHANNEL_4  // D2, GPIO4, ADC1
+#else
+#error "Radar node supports ESP32-S3 and ESP32-C3"
+#endif
 #define RADAR_UART_BAUD 256000
+#define BATTERY_SAMPLE_INTERVAL_MS 5000
+#define BATTERY_SAMPLE_COUNT 16
 
 #define RADAR_CHANNEL 1
 #define RADAR_NAME_MAX 24
@@ -63,9 +79,69 @@ static uint32_t s_sequence;
 static uint32_t s_telemetry_sent;
 static uint32_t s_telemetry_send_failures;
 static bool s_uart_sample_logged;
+static adc_oneshot_unit_handle_t s_battery_adc;
+static adc_cali_handle_t s_battery_cali;
 
 static uint32_t uptime_ms(void) {
   return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static void initialize_battery_adc(void) {
+  const adc_oneshot_unit_init_cfg_t unit = {.unit_id = ADC_UNIT_1};
+  const adc_oneshot_chan_cfg_t channel = {
+      .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+  esp_err_t err = adc_oneshot_new_unit(&unit, &s_battery_adc);
+  if (err == ESP_OK) {
+    err = adc_oneshot_config_channel(s_battery_adc, BATTERY_ADC_CHANNEL, &channel);
+  }
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "Battery ADC setup failed: %s", esp_err_to_name(err));
+    if (s_battery_adc) adc_oneshot_del_unit(s_battery_adc);
+    s_battery_adc = NULL;
+    return;
+  }
+
+#if ADC_CALI_SCHEME_CURVE_FITTING_SUPPORTED
+  const adc_cali_curve_fitting_config_t curve = {
+      .unit_id = ADC_UNIT_1, .chan = BATTERY_ADC_CHANNEL,
+      .atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
+  err = adc_cali_create_scheme_curve_fitting(&curve, &s_battery_cali);
+#elif ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+  const adc_cali_line_fitting_config_t line = {
+      .unit_id = ADC_UNIT_1, .atten = ADC_ATTEN_DB_12,
+      .bitwidth = ADC_BITWIDTH_DEFAULT};
+  err = adc_cali_create_scheme_line_fitting(&line, &s_battery_cali);
+#else
+  err = ESP_ERR_NOT_SUPPORTED;
+#endif
+  if (err != ESP_OK) {
+    s_battery_cali = NULL;
+    ESP_LOGW(TAG, "Battery ADC calibration unavailable: %s", esp_err_to_name(err));
+  }
+}
+
+static bool read_battery(int *millivolts, int *percent) {
+  if (!s_battery_adc || !s_battery_cali) return false;
+  int raw_sum = 0;
+  for (int i = 0; i < BATTERY_SAMPLE_COUNT; ++i) {
+    int raw;
+    if (adc_oneshot_read(s_battery_adc, BATTERY_ADC_CHANNEL, &raw) != ESP_OK) {
+      return false;
+    }
+    raw_sum += raw;
+  }
+  int divider_mv;
+  if (adc_cali_raw_to_voltage(s_battery_cali, raw_sum / BATTERY_SAMPLE_COUNT,
+                              &divider_mv) != ESP_OK) return false;
+  // Equal 1 MΩ resistors divide the cell voltage by two.
+  int battery_mv = divider_mv * 2;
+  if (battery_mv < 2500 || battery_mv > 4500) return false;
+  int charge = (battery_mv - 3000) * 100 / 1200;
+  if (charge < 0) charge = 0;
+  if (charge > 100) charge = 100;
+  *millivolts = battery_mv;
+  *percent = charge;
+  return true;
 }
 
 static bool ensure_peer(const uint8_t mac[6]) {
@@ -114,6 +190,22 @@ static bool send_packet(const uint8_t mac[6], uint8_t type, const char *text) {
 
 static void send_hello(void) {
   (void)send_packet(s_broadcast_mac, ESPNOW_TYPE_HELLO, NULL);
+}
+
+static void update_battery(void) {
+  int millivolts = -1;
+  int percent = -1;
+  bool valid = read_battery(&millivolts, &percent);
+  if (valid) {
+    ESP_LOGI(TAG, "Battery: %d mV, approximately %d%%", millivolts, percent);
+  } else {
+    ESP_LOGW(TAG, "Battery voltage unavailable");
+  }
+  if (s_streaming && s_host_known) {
+    char text[40];
+    snprintf(text, sizeof(text), "RADAR_BATTERY,%d,%d", millivolts, percent);
+    (void)send_packet(s_host_mac, ESPNOW_TYPE_MESSAGE, text);
+  }
 }
 
 static void radar_receive_callback(const esp_now_recv_info_t *info,
@@ -218,6 +310,7 @@ static void initialize_wifi(void) {
 
 void app_main(void) {
   initialize_nvs();
+  initialize_battery_adc();
   initialize_wifi();
 
   uint8_t mac[6] = {0};
@@ -246,11 +339,16 @@ void app_main(void) {
   uint32_t last_hello = uptime_ms();
   uint32_t last_telemetry = uptime_ms();
   uint32_t last_diagnostic = uptime_ms();
+  uint32_t last_battery = uptime_ms() - BATTERY_SAMPLE_INTERVAL_MS;
   while (true) {
     (void)radar_sensor_update(&s_radar);
     handle_commands();
 
     uint32_t now = uptime_ms();
+    if ((uint32_t)(now - last_battery) >= BATTERY_SAMPLE_INTERVAL_MS) {
+      update_battery();
+      last_battery = now;
+    }
     if ((uint32_t)(now - last_hello) >= RADAR_HELLO_INTERVAL_MS) {
       send_hello();
       last_hello = now;

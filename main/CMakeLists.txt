@@ -6,6 +6,7 @@ idf_component_register(
         "."
         "include"
     REQUIRES
+        esp_adc
         esp_common
         esp_driver_gpio
         esp_driver_uart
